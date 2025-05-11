@@ -4,8 +4,46 @@ import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mc
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import { promises as fs } from "fs";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
+import dotenv from "dotenv";
 
+// Load environment variables from .env file
+dotenv.config();
 
+// Initialize Gemini API using the API key from environment variables
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+if (!GEMINI_API_KEY) {
+  console.warn('Warning: GEMINI_API_KEY not found in environment variables. The nl-to-sql tool will not work properly.');
+}
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+
+// Get the directory path using import.meta.url (ESM approach)
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// Load database schemas from files
+async function loadDatabaseSchemas() {
+  const schemasDir = join(__dirname, 'schemas');
+  const schemaFiles = await fs.readdir(schemasDir);
+  const schemas: Record<string, string> = {};
+  
+  for (const file of schemaFiles) {
+    if (file.endsWith('.sql')) {
+      const tableName = file.replace('.sql', '');
+      const filePath = join(schemasDir, file);
+      const content = await fs.readFile(filePath, 'utf-8');
+      schemas[tableName] = content;
+    }
+  }
+  
+  return schemas;
+}
+
+// Store loaded schemas
+let databaseSchemas: Record<string, string> = {};
 
 const app = express();
 app.use(express.json());
@@ -51,14 +89,40 @@ app.post('/mcp', async (req, res) => {
           resources: [
             { name: "math", uri: "docs://math", description: "Math documentation" },
             { name: "conversion", uri: "docs://conversion", description: "Unit conversion documentation" },
-            { name: "date-formatting", uri: "docs://date-formatting", description: "Date formatting documentation" }
+            { name: "date-formatting", uri: "docs://date-formatting", description: "Date formatting documentation" },
+            { name: "sql", uri: "docs://sql", description: "SQL query generation documentation" }
           ]
         })
       }),
       async (uri, { topic }) => ({
         contents: [{
           uri: uri.href,
-          text: `Documentation for ${topic}\n\nThis is a sample documentation resource for the ${topic} feature.`
+          text: topic === "sql" 
+            ? `Documentation for SQL Query Generation\n\n` +
+              `The nl-to-sql tool converts natural language queries to SQL statements based on the available database schemas.\n\n` +
+              `Example Queries:\n\n` +
+              `1. Employee Queries:\n` +
+              `   - "Find all employees in the IT department with a salary over 70000"\n` +
+              `   - "What's the average salary by department?"\n` +
+              `   - "List the top 5 highest paid employees with their manager names"\n` +
+              `   - "Which employees were hired in 2023?"\n` +
+              `   - "Show me all employees that report to manager with ID 5"\n\n` +
+              `2. Project Queries:\n` +
+              `   - "List all projects that are currently in progress"\n` +
+              `   - "Find projects with a budget over 100000 managed by employees from the IT department"\n` +
+              `   - "Show all employees working on the Marketing Campaign project"\n` +
+              `   - "What's the total budget for all completed projects?"\n\n` +
+              `3. Complex Queries:\n` +
+              `   - "Find departments with more than 5 employees where the average salary is above 60000"\n` +
+              `   - "List employees that are both project managers and also assigned to work on other projects"\n` +
+              `   - "Which employees are not assigned to any projects?"\n` +
+              `   - "Show the salary difference between employees and their managers"\n\n` +
+              `To use this tool, simply call it with your natural language query:\n\n` +
+              `{\n` +
+              `  "query": "Find all employees in the IT department with a salary over 70000"\n` +
+              `}\n\n` +
+              `Note: All database schemas are already loaded in the server. You don't need to provide them.`
+            : `Documentation for ${topic}\n\nThis is a sample documentation resource for the ${topic} feature.`
         }]
       })
     );
@@ -161,6 +225,55 @@ app.post('/mcp', async (req, res) => {
       }
     );
     
+    server.tool(
+      "nl-to-sql",
+      {
+        query: z.string().describe(
+          "Convert natural language to SQL for our HR database. " +
+          "Available tables: employees (with personal details, salary, department_id, manager_id), " +
+          "departments (id, name, location, budget), " +
+          "projects (id, name, dates, status, budget), " +
+          "employee_projects (assignments of employees to projects). " +
+          "Examples: 'Find employees in IT earning over 70k', 'List projects ending this year', 'Show managers with most direct reports'"
+        )
+      },
+      async ({ query }) => {
+        try {
+          const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+          
+          // Prepare the prompt with schema information and the query
+          let promptText = "You are a SQL expert that converts natural language queries to precise SQL. ";
+          promptText += "Based on the following database schema:\n\n";
+          
+          // Add each schema definition to the prompt
+          Object.entries(databaseSchemas).forEach(([tableName, ddl]) => {
+            promptText += `Table: ${tableName}\n${ddl}\n\n`;
+          });
+          
+          // Add the natural language query
+          promptText += `Convert this natural language query to valid SQL:\n"${query}"\n\n`;
+          promptText += "Respond only with the SQL query, no explanation or other text.";
+          
+          // Generate content using Gemini
+          const result = await model.generateContent(promptText);
+          const response = await result.response;
+          const sqlQuery = response.text().trim();
+          
+          return {
+            content: [
+              { type: "text", text: sqlQuery },
+              { type: "text", text: "\n\nGenerated from natural language query: " + query }
+            ]
+          };
+        } catch (error) {
+          console.error("Error in nl-to-sql tool:", error);
+          return {
+            content: [{ type: "text", text: `Error generating SQL from natural language: ${error.message || error}` }]
+          };
+        }
+      }
+    );
+    
     // Helper for date formatting
     function formatDate(date: Date, format: string): string {
       const year = date.getFullYear().toString();
@@ -231,6 +344,14 @@ app.post('/mcp', async (req, res) => {
 
   // Handle the request
   await transport.handleRequest(req, res, req.body);
+});
+
+// Load schemas before handling requests
+loadDatabaseSchemas().then(schemas => {
+  databaseSchemas = schemas;
+  console.log(`Loaded ${Object.keys(schemas).length} database schema(s):`, Object.keys(schemas));
+}).catch(error => {
+  console.error('Error loading database schemas:', error);
 });
 
 // Reusable handler for GET and DELETE requests
